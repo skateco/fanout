@@ -124,31 +124,71 @@ func (f *Fanout) ServeDNS(ctx context.Context, w dns.ResponseWriter, m *dns.Msg)
 	return 0, nil
 }
 
+func (f *Fanout) mergeResult(from *response, to *response) *response {
+	if to == nil {
+		return from
+	}
+	// 'to' no longer nil
+
+	if from == nil {
+		return to
+	}
+
+	if from.err != nil {
+		return to
+	}
+
+	if to.err != nil {
+		return from
+	}
+
+	if to.response.Rcode != dns.RcodeSuccess {
+		return from
+	}
+
+	if from.response.Rcode == dns.RcodeSuccess {
+		to.response.Answer = append(to.response.Answer, from.response.Answer...)
+	}
+	// merge records
+	return to
+}
+
+/**		count--
+if isBetter(result, r) {
+	result = r
+}
+if count == 0 {
+	return result
+}
+if r.err != nil {
+	break
+}
+if f.race {
+	return r
+}
+if r.response.Rcode != dns.RcodeSuccess {
+	break
+}
+return r
+*/
+
 func (f *Fanout) getFanoutResult(ctx context.Context, responseCh <-chan *response) *response {
 	count := len(f.clients)
-	var result *response
+	var mergedResult *response
 	for {
 		select {
 		case <-ctx.Done():
-			return result
+			return mergedResult
 		case r := <-responseCh:
 			count--
-			if isBetter(result, r) {
-				result = r
-			}
+			mergedResult = f.mergeResult(r, mergedResult)
 			if count == 0 {
-				return result
+				return mergedResult
 			}
-			if r.err != nil {
-				break
-			}
+			// not sure if this should configurable when waiting for all is chosen
 			if f.race {
-				return r
+				return mergedResult
 			}
-			if r.response.Rcode != dns.RcodeSuccess {
-				break
-			}
-			return r
 		}
 	}
 }

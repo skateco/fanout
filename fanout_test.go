@@ -249,7 +249,7 @@ func (t *fanoutTestSuite) TestTwoServersUnsuccessfulResponse() {
 		t.Nil(err)
 	}
 	for _, m := range writer.answers {
-		t.Equal(m.MsgHdr.Rcode, dns.RcodeSuccess)
+		t.Equal(dns.RcodeSuccess, m.MsgHdr.Rcode)
 	}
 }
 
@@ -272,7 +272,7 @@ func (t *fanoutTestSuite) TestCanReturnUnsuccessfulRepose() {
 	_, err := f.ServeDNS(context.Background(), writer, req)
 	t.Nil(err)
 	t.Len(writer.answers, 1)
-	t.Equal(writer.answers[0].MsgHdr.Rcode, dns.RcodeNameError, "fanout plugin returns first negative answer if other answers on request are negative")
+	t.Equal(dns.RcodeNameError, writer.answers[0].MsgHdr.Rcode, "fanout plugin returns first negative answer if other answers on request are negative")
 }
 
 func (t *fanoutTestSuite) TestBusyServer() {
@@ -360,8 +360,8 @@ func (t *fanoutTestSuite) TestTwoServers() {
 	t.Nil(err)
 	mutex.Lock()
 	defer mutex.Unlock()
-	t.Equal(answerCount1, expected)
-	t.Equal(answerCount2, expected)
+	t.Equal(expected, answerCount1)
+	t.Equal(expected, answerCount2)
 }
 
 func TestFanoutUDPSuite(t *testing.T) {
@@ -374,6 +374,6 @@ func TestFanoutTCPSuite(t *testing.T) {
 func nxdomainMsg() *dns.Msg {
 	return &dns.Msg{MsgHdr: dns.MsgHdr{Rcode: dns.RcodeNameError},
 		Question: []dns.Question{{Name: "wwww.example1.", Qclass: dns.ClassINET, Qtype: dns.TypeTXT}},
-		Ns: []dns.RR{test.SOA("example1.	1800	IN	SOA	example1.net. example1.com 1461471181 14400 3600 604800 14400")},
+		Ns:       []dns.RR{test.SOA("example1.	1800	IN	SOA	example1.net. example1.com 1461471181 14400 3600 604800 14400")},
 	}
 }

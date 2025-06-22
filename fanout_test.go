@@ -1,5 +1,7 @@
 // Copyright (c) 2020 Doc.ai and/or its affiliates.
 //
+// Copyright (c) 2024 MWS and/or its affiliates.
+//
 // SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,7 +21,7 @@ package fanout
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
+	"math/rand"
 	"net"
 	"os"
 	"strings"
@@ -28,15 +30,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/require"
-	"go.uber.org/goleak"
-
 	"github.com/coredns/caddy"
 	"github.com/coredns/coredns/plugin/pkg/dnstest"
-	"github.com/stretchr/testify/suite"
-
 	"github.com/coredns/coredns/plugin/test"
 	"github.com/miekg/dns"
+	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/suite"
+	"go.uber.org/goleak"
 )
 
 const testQuery = "example1."
@@ -69,13 +69,13 @@ func newServer(network string, f dns.HandlerFunc) *server {
 	s.Handler = f
 
 	for i := 0; i < 10; i++ {
-		if network == tcp {
-			s.Listener, _ = net.Listen(tcp, ":0")
+		if network == TCP {
+			s.Listener, _ = net.Listen(TCP, ":0")
 			if s.Listener != nil {
 				break
 			}
 		} else {
-			s.Listener, _ = net.Listen(tcp, ":0")
+			s.Listener, _ = net.Listen(TCP, ":0")
 			if s.Listener == nil {
 				continue
 			}
@@ -112,7 +112,7 @@ type fanoutTestSuite struct {
 }
 
 func TestFanout_ExceptFile(t *testing.T) {
-	file, err := ioutil.TempFile(os.TempDir(), t.Name())
+	file, err := os.CreateTemp(os.TempDir(), t.Name())
 	exclude := []string{"example1.com.", "example2.com."}
 	require.Nil(t, err)
 	defer func() {
@@ -127,7 +127,7 @@ func TestFanout_ExceptFile(t *testing.T) {
 	f, err := parseFanout(c)
 	require.Nil(t, err)
 	for _, e := range exclude {
-		require.True(t, f.excludeDomains.Contains(e))
+		require.True(t, f.ExcludeDomains.Contains(e))
 	}
 }
 
@@ -174,12 +174,12 @@ func (t *fanoutTestSuite) TestWorkerCountLessThenServers() {
 	}
 	defer free()
 	f := New()
-	f.from = "."
+	f.From = "."
 
 	for i := 0; i < 4; i++ {
-		incorrectServer := newServer(t.network, func(w dns.ResponseWriter, r *dns.Msg) {
+		incorrectServer := newServer(t.network, func(_ dns.ResponseWriter, _ *dns.Msg) {
 		})
-		f.addClient(NewClient(incorrectServer.addr, t.network))
+		f.AddClient(NewClient(incorrectServer.addr, t.network))
 		closeFuncs = append(closeFuncs, incorrectServer.close)
 	}
 	correctServer := newServer(t.network, func(w dns.ResponseWriter, r *dns.Msg) {
@@ -196,9 +196,9 @@ func (t *fanoutTestSuite) TestWorkerCountLessThenServers() {
 	})
 	defer correctServer.close()
 
-	f.addClient(NewClient(correctServer.addr, t.network))
-	f.workerCount = 1
-	f.attempts = 1
+	f.AddClient(NewClient(correctServer.addr, t.network))
+	f.WorkerCount = 1
+	f.Attempts = 1
 	req := new(dns.Msg)
 	req.SetQuestion(testQuery, dns.TypeA)
 	_, err := f.ServeDNS(context.TODO(), &test.ResponseWriter{}, req)
@@ -238,9 +238,9 @@ func (t *fanoutTestSuite) TestTwoServersUnsuccessfulResponse() {
 	c2 := NewClient(s2.addr, t.network)
 	f := New()
 	f.net = t.network
-	f.from = "."
-	f.addClient(c1)
-	f.addClient(c2)
+	f.From = "."
+	f.AddClient(c1)
+	f.AddClient(c2)
 	writer := &cachedDNSWriter{ResponseWriter: new(test.ResponseWriter)}
 	for i := 0; i < 10; i++ {
 		req := new(dns.Msg)
@@ -263,9 +263,9 @@ func (t *fanoutTestSuite) TestCanReturnUnsuccessfulRepose() {
 	defer s.close()
 	f := New()
 	f.net = t.network
-	f.from = "."
+	f.From = "."
 	c := NewClient(s.addr, t.network)
-	f.addClient(c)
+	f.AddClient(c)
 	req := new(dns.Msg)
 	req.SetQuestion(testQuery, dns.TypeA)
 	writer := &cachedDNSWriter{ResponseWriter: new(test.ResponseWriter)}
@@ -280,9 +280,8 @@ func (t *fanoutTestSuite) TestBusyServer() {
 	var requestNum, answerCount int32
 	totalRequestNum := int32(5)
 	s := newServer(t.network, func(w dns.ResponseWriter, r *dns.Msg) {
-		if atomic.LoadInt32(&requestNum)%2 == 0 {
-			// server is busy
-		} else if r.Question[0].Name == testQuery {
+		serverIsBusy := atomic.LoadInt32(&requestNum)%2 == 0
+		if !serverIsBusy && r.Question[0].Name == testQuery {
 			msg := dns.Msg{
 				Answer: []dns.RR{makeRecordA("example1 3600	IN	A 10.0.0.1")},
 			}
@@ -296,9 +295,9 @@ func (t *fanoutTestSuite) TestBusyServer() {
 	c := NewClient(s.addr, t.network)
 	f := New()
 	f.net = t.network
-	f.from = "."
-	f.attempts = 0
-	f.addClient(c)
+	f.From = "."
+	f.Attempts = 0
+	f.AddClient(c)
 	req := new(dns.Msg)
 	req.SetQuestion(testQuery, dns.TypeA)
 	for i := int32(0); i < totalRequestNum; i++ {
@@ -345,9 +344,9 @@ func (t *fanoutTestSuite) TestTwoServers() {
 	c2 := NewClient(s2.addr, t.network)
 	f := New()
 	f.net = t.network
-	f.from = "."
-	f.addClient(c1)
-	f.addClient(c2)
+	f.From = "."
+	f.AddClient(c1)
+	f.AddClient(c2)
 
 	req := new(dns.Msg)
 	req.SetQuestion(testQuery, dns.TypeA)
@@ -364,11 +363,58 @@ func (t *fanoutTestSuite) TestTwoServers() {
 	t.Equal(expected, answerCount2)
 }
 
+func (t *fanoutTestSuite) TestServerCount() {
+	defer goleak.VerifyNone(t.T())
+	const expected = 1
+	var mutex sync.Mutex
+	answerCount := 0
+
+	testFunc := func(w dns.ResponseWriter, r *dns.Msg) {
+		if r.Question[0].Name == testQuery {
+			msg := dns.Msg{
+				Answer: []dns.RR{makeRecordA("example1 3600	IN	A 10.0.0.1")},
+			}
+			mutex.Lock()
+			answerCount++
+			mutex.Unlock()
+			msg.SetReply(r)
+			logErrIfNotNil(w.WriteMsg(&msg))
+		}
+	}
+	s1 := newServer(t.network, testFunc)
+	defer s1.close()
+	s2 := newServer(t.network, testFunc)
+	defer s2.close()
+
+	c1 := NewClient(s1.addr, t.network)
+	c2 := NewClient(s2.addr, t.network)
+	f := New()
+	f.ServerSelectionPolicy = &WeightedPolicy{
+		loadFactor: []int{50, 100},
+		//nolint:gosec // init rand with constant seed to get predefined result
+		r: rand.New(rand.NewSource(1)),
+	}
+	f.net = t.network
+	f.From = "."
+	f.AddClient(c1)
+	f.AddClient(c2)
+	f.serverCount = 1
+
+	req := new(dns.Msg)
+	req.SetQuestion(testQuery, dns.TypeA)
+	_, err := f.ServeDNS(context.TODO(), &test.ResponseWriter{}, req)
+	t.Nil(err)
+
+	mutex.Lock()
+	t.Equal(expected, answerCount)
+	mutex.Unlock()
+}
+
 func TestFanoutUDPSuite(t *testing.T) {
-	suite.Run(t, &fanoutTestSuite{network: udp})
+	suite.Run(t, &fanoutTestSuite{network: UDP})
 }
 func TestFanoutTCPSuite(t *testing.T) {
-	suite.Run(t, &fanoutTestSuite{network: tcp})
+	suite.Run(t, &fanoutTestSuite{network: TCP})
 }
 
 func nxdomainMsg() *dns.Msg {

@@ -1,5 +1,7 @@
 // Copyright (c) 2020 Doc.ai and/or its affiliates.
 //
+// Copyright (c) 2024 MWS and/or its affiliates.
+//
 // SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,7 +19,8 @@
 package fanout
 
 import (
-	"io/ioutil"
+	"math/rand"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -58,8 +61,8 @@ func setup(c *caddy.Controller) error {
 
 	c.OnStartup(func() error {
 		if taph := dnsserver.GetConfig(c).Handler("dnstap"); taph != nil {
-			if tapPlugin, ok := taph.(dnstap.Dnstap); ok {
-				f.tapPlugin = &tapPlugin
+			if tapPlugin, ok := taph.(*dnstap.Dnstap); ok {
+				f.TapPlugin = tapPlugin
 			}
 		}
 		return f.OnStartup()
@@ -101,52 +104,84 @@ func parseFanout(c *caddy.Controller) (*Fanout, error) {
 
 func parsefanoutStanza(c *caddyfile.Dispenser) (*Fanout, error) {
 	f := New()
-	if !c.NextArg() {
+	if !c.Args(&f.From) {
 		return f, c.ArgErr()
 	}
-	f.from = plugin.Host(c.Val()).NormalizeExact()[0]
+
+	normalized := plugin.Host(f.From).NormalizeExact()
+	if len(normalized) == 0 {
+		return nil, errors.Errorf("unable to normalize '%s'", f.From)
+	}
+	f.From = normalized[0]
+
 	to := c.RemainingArgs()
 	if len(to) == 0 {
 		return f, c.ArgErr()
 	}
-
 	toHosts, err := parse.HostPortOrFile(to...)
 	if err != nil {
 		return f, err
 	}
-
-	transports := make([]string, len(toHosts))
 	for c.NextBlock() {
 		err = parseValue(strings.ToLower(c.Val()), f, c)
 		if err != nil {
 			return nil, err
 		}
 	}
-	for i, host := range toHosts {
+	initClients(f, toHosts)
+	err = initServerSelectionPolicy(f)
+	if err != nil {
+		return nil, err
+	}
+
+	if f.WorkerCount > len(f.clients) || f.WorkerCount == 0 {
+		f.WorkerCount = len(f.clients)
+	}
+
+	return f, nil
+}
+
+func initClients(f *Fanout, hosts []string) {
+	transports := make([]string, len(hosts))
+	for i, host := range hosts {
 		trans, h := parse.Transport(host)
-		p := NewClient(h, f.net)
-		f.clients = append(f.clients, p)
+		f.clients = append(f.clients, NewClient(h, f.net))
 		transports[i] = trans
 	}
 
-	if f.tlsServerName != "" {
-		f.tlsConfig.ServerName = f.tlsServerName
-	}
+	f.tlsConfig.ServerName = f.tlsServerName
 	for i := range f.clients {
 		if transports[i] == transport.TLS {
 			f.clients[i].SetTLSConfig(f.tlsConfig)
 		}
 	}
+}
 
-	workerCount := f.workerCount
-
-	if workerCount > len(f.clients) || workerCount == 0 {
-		workerCount = len(f.clients)
+func initServerSelectionPolicy(f *Fanout) error {
+	if f.serverCount > len(f.clients) || f.serverCount == 0 {
+		f.serverCount = len(f.clients)
 	}
 
-	f.workerCount = workerCount
+	loadFactor := f.loadFactor
+	if len(loadFactor) == 0 {
+		for i := 0; i < len(f.clients); i++ {
+			loadFactor = append(loadFactor, maxLoadFactor)
+		}
+	}
+	if len(loadFactor) != len(f.clients) {
+		return errors.New("load-factor params count must be the same as the number of hosts")
+	}
 
-	return f, nil
+	f.ServerSelectionPolicy = &SequentialPolicy{}
+	if f.policyType == policyWeightedRandom {
+		f.ServerSelectionPolicy = &WeightedPolicy{
+			loadFactor: loadFactor,
+			//nolint:gosec // it's overhead to use crypto/rand here
+			r: rand.New(rand.NewSource(time.Now().UnixNano())),
+		}
+	}
+
+	return nil
 }
 
 func parseValue(v string, f *Fanout, c *caddyfile.Dispenser) error {
@@ -159,6 +194,14 @@ func parseValue(v string, f *Fanout, c *caddyfile.Dispenser) error {
 		return parseTLSServer(f, c)
 	case "worker-count":
 		return parseWorkerCount(f, c)
+	case "policy":
+		return parsePolicy(f, c)
+	case "weighted-random-server-count":
+		serverCount, err := parsePositiveInt(c)
+		f.serverCount = serverCount
+		return err
+	case "weighted-random-load-factor":
+		return parseLoadFactor(f, c)
 	case "timeout":
 		return parseTimeout(f, c)
 	case "race":
@@ -169,11 +212,25 @@ func parseValue(v string, f *Fanout, c *caddyfile.Dispenser) error {
 		return parseIgnoredFromFile(f, c)
 	case "attempt-count":
 		num, err := parsePositiveInt(c)
-		f.attempts = num
+		f.Attempts = num
 		return err
 	default:
 		return errors.Errorf("unknown property %v", v)
 	}
+}
+
+func parsePolicy(f *Fanout, c *caddyfile.Dispenser) error {
+	if !c.NextArg() {
+		return c.ArgErr()
+	}
+
+	policyType := strings.ToLower(c.Val())
+	if policyType != policyWeightedRandom && policyType != policySequential {
+		return errors.Errorf("unknown policy %q", c.Val())
+	}
+	f.policyType = policyType
+
+	return nil
 }
 
 func parseTimeout(f *Fanout, c *caddyfile.Dispenser) error {
@@ -182,7 +239,7 @@ func parseTimeout(f *Fanout, c *caddyfile.Dispenser) error {
 	}
 	var err error
 	val := c.Val()
-	f.timeout, err = time.ParseDuration(val)
+	f.Timeout, err = time.ParseDuration(val)
 	return err
 }
 
@@ -190,7 +247,7 @@ func parseRace(f *Fanout, c *caddyfile.Dispenser) error {
 	if c.NextArg() {
 		return c.ArgErr()
 	}
-	f.race = true
+	f.Race = true
 	return nil
 }
 
@@ -199,13 +256,17 @@ func parseIgnoredFromFile(f *Fanout, c *caddyfile.Dispenser) error {
 	if len(args) != 1 {
 		return c.ArgErr()
 	}
-	b, err := ioutil.ReadFile(filepath.Clean(args[0]))
+	b, err := os.ReadFile(filepath.Clean(args[0]))
 	if err != nil {
 		return err
 	}
 	names := strings.Split(string(b), "\n")
 	for i := 0; i < len(names); i++ {
-		f.excludeDomains.AddString(plugin.Host(names[i]).Normalize())
+		normalized := plugin.Host(names[i]).NormalizeExact()
+		if len(normalized) == 0 {
+			return errors.Errorf("unable to normalize '%s'", names[i])
+		}
+		f.ExcludeDomains.AddString(normalized[0])
 	}
 	return nil
 }
@@ -216,23 +277,52 @@ func parseIgnored(f *Fanout, c *caddyfile.Dispenser) error {
 		return c.ArgErr()
 	}
 	for i := 0; i < len(ignore); i++ {
-		f.excludeDomains.AddString(plugin.Host(ignore[i]).Normalize())
+		normalized := plugin.Host(ignore[i]).NormalizeExact()
+		if len(normalized) == 0 {
+			return errors.Errorf("unable to normalize '%s'", ignore[i])
+		}
+		f.ExcludeDomains.AddString(normalized[0])
 	}
 	return nil
 }
 
 func parseWorkerCount(f *Fanout, c *caddyfile.Dispenser) error {
 	var err error
-	f.workerCount, err = parsePositiveInt(c)
+	f.WorkerCount, err = parsePositiveInt(c)
 	if err == nil {
-		if f.workerCount < minWorkerCount {
+		if f.WorkerCount < minWorkerCount {
 			return errors.New("worker count should be more or equal 2. Consider to use Forward plugin")
 		}
-		if f.workerCount > maxWorkerCount {
+		if f.WorkerCount > maxWorkerCount {
 			return errors.Errorf("worker count more then max value: %v", maxWorkerCount)
 		}
 	}
 	return err
+}
+
+func parseLoadFactor(f *Fanout, c *caddyfile.Dispenser) error {
+	args := c.RemainingArgs()
+	if len(args) == 0 {
+		return c.ArgErr()
+	}
+
+	for _, arg := range args {
+		loadFactor, err := strconv.Atoi(arg)
+		if err != nil {
+			return c.ArgErr()
+		}
+
+		if loadFactor < minLoadFactor {
+			return errors.New("load-factor should be more or equal 1")
+		}
+		if loadFactor > maxLoadFactor {
+			return errors.Errorf("load-factor %d should be less than %d", loadFactor, maxLoadFactor)
+		}
+
+		f.loadFactor = append(f.loadFactor, loadFactor)
+	}
+
+	return nil
 }
 
 func parsePositiveInt(c *caddyfile.Dispenser) (int, error) {
@@ -263,7 +353,7 @@ func parseProtocol(f *Fanout, c *caddyfile.Dispenser) error {
 		return c.ArgErr()
 	}
 	net := strings.ToLower(c.Val())
-	if net != tcp && net != udp && net != tcptls {
+	if net != TCP && net != UDP && net != TCPTLS {
 		return errors.New("unknown network protocol")
 	}
 	f.net = net

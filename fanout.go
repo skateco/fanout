@@ -1,5 +1,7 @@
 // Copyright (c) 2020 Doc.ai and/or its affiliates.
 //
+// Copyright (c) 2024 MWS and/or its affiliates.
+//
 // SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,6 +21,7 @@ package fanout
 import (
 	"context"
 	"crypto/tls"
+	"sync"
 	"time"
 
 	"github.com/coredns/coredns/plugin"
@@ -35,34 +38,42 @@ var log = clog.NewWithPlugin("fanout")
 
 // Fanout represents a plugin instance that can do async requests to list of DNS servers.
 type Fanout struct {
-	clients        []Client
-	tlsConfig      *tls.Config
-	excludeDomains Domain
-	tlsServerName  string
-	timeout        time.Duration
-	race           bool
-	net            string
-	from           string
-	attempts       int
-	workerCount    int
-	tapPlugin      *dnstap.Dnstap
-	Next           plugin.Handler
+	clients               []Client
+	tlsConfig             *tls.Config
+	ExcludeDomains        Domain
+	tlsServerName         string
+	Timeout               time.Duration
+	Race                  bool
+	net                   string
+	From                  string
+	Attempts              int
+	WorkerCount           int
+	serverCount           int
+	loadFactor            []int
+	policyType            string
+	ServerSelectionPolicy policy
+	TapPlugin             *dnstap.Dnstap
+	Next                  plugin.Handler
+	WaitAll               bool
 }
 
 // New returns reference to new Fanout plugin instance with default configs.
 func New() *Fanout {
 	return &Fanout{
-		tlsConfig:      new(tls.Config),
-		net:            "udp",
-		attempts:       3,
-		timeout:        defaultTimeout,
-		excludeDomains: NewDomain(),
+		tlsConfig:             new(tls.Config),
+		net:                   "udp",
+		Attempts:              3,
+		Timeout:               defaultTimeout,
+		ExcludeDomains:        NewDomain(),
+		ServerSelectionPolicy: &SequentialPolicy{}, // default policy
 	}
 }
 
-func (f *Fanout) addClient(p Client) {
+// AddClient is used to add a new DNS server to the fanout
+func (f *Fanout) AddClient(p Client) {
 	f.clients = append(f.clients, p)
-	f.workerCount++
+	f.WorkerCount++
+	f.serverCount++
 }
 
 // Name implements plugin.Handler.
@@ -76,31 +87,14 @@ func (f *Fanout) ServeDNS(ctx context.Context, w dns.ResponseWriter, m *dns.Msg)
 	if !f.match(&req) {
 		return plugin.NextOrFailure(f.Name(), f.Next, ctx, w, m)
 	}
-	timeoutContext, cancel := context.WithTimeout(ctx, f.timeout)
+	timeoutContext, cancel := context.WithTimeout(ctx, f.Timeout)
 	defer cancel()
-	clientCount := len(f.clients)
-	workerChannel := make(chan Client, f.workerCount)
-	responseCh := make(chan *response, clientCount)
-	go func() {
-		defer close(workerChannel)
-		for i := 0; i < clientCount; i++ {
-			client := f.clients[i]
-			select {
-			case <-timeoutContext.Done():
-				return
-			case workerChannel <- client:
-				continue
-			}
-		}
-	}()
-	for i := 0; i < f.workerCount; i++ {
-		go func() {
-			for c := range workerChannel {
-				responseCh <- f.processClient(timeoutContext, c, &request.Request{W: w, Req: m})
-			}
-		}()
+	var result *response
+	if f.WaitAll {
+		result = f.getWaitAllFanoutResult(timeoutContext, f.runWorkers(timeoutContext, &req))
+	} else {
+		result = f.getFanoutResult(timeoutContext, f.runWorkers(timeoutContext, &req))
 	}
-	result := f.getFanoutResult(timeoutContext, responseCh)
 	if result == nil {
 		return dns.RcodeServerFailure, timeoutContext.Err()
 	}
@@ -110,8 +104,8 @@ func (f *Fanout) ServeDNS(ctx context.Context, w dns.ResponseWriter, m *dns.Msg)
 	if result.err != nil {
 		return dns.RcodeServerFailure, result.err
 	}
-	if f.tapPlugin != nil {
-		toDnstap(f, result.client.Endpoint(), &req, result.response, result.start)
+	if f.TapPlugin != nil {
+		toDnstap(f.TapPlugin, result.client, &req, result.response, result.start)
 	}
 	if !req.Match(result.response) {
 		debug.Hexdumpf(result.response, "Wrong reply for id: %d, %s %d", result.response.Id, req.QName(), req.QType())
@@ -153,26 +147,7 @@ func (f *Fanout) mergeResult(from *response, to *response) *response {
 	return to
 }
 
-/**		count--
-if isBetter(result, r) {
-	result = r
-}
-if count == 0 {
-	return result
-}
-if r.err != nil {
-	break
-}
-if f.race {
-	return r
-}
-if r.response.Rcode != dns.RcodeSuccess {
-	break
-}
-return r
-*/
-
-func (f *Fanout) getFanoutResult(ctx context.Context, responseCh <-chan *response) *response {
+func (f *Fanout) getWaitAllFanoutResult(ctx context.Context, responseCh <-chan *response) *response {
 	count := len(f.clients)
 	var mergedResult *response
 	for {
@@ -185,16 +160,74 @@ func (f *Fanout) getFanoutResult(ctx context.Context, responseCh <-chan *respons
 			if count == 0 {
 				return mergedResult
 			}
-			// not sure if this should configurable when waiting for all is chosen
-			if f.race {
-				return mergedResult
+		}
+	}
+}
+
+func (f *Fanout) runWorkers(ctx context.Context, req *request.Request) chan *response {
+	sel := f.ServerSelectionPolicy.selector(f.clients)
+	workerCh := make(chan Client, f.WorkerCount)
+	responseCh := make(chan *response, f.serverCount)
+	go func() {
+		defer close(workerCh)
+		for i := 0; i < f.serverCount; i++ {
+			select {
+			case <-ctx.Done():
+				return
+			case workerCh <- sel.Pick():
+			}
+		}
+	}()
+
+	go func() {
+		var wg sync.WaitGroup
+		wg.Add(f.WorkerCount)
+
+		for i := 0; i < f.WorkerCount; i++ {
+			go func() {
+				defer wg.Done()
+				for c := range workerCh {
+					select {
+					case <-ctx.Done():
+						return
+					case responseCh <- f.processClient(ctx, c, &request.Request{W: req.W, Req: req.Req}):
+					}
+				}
+			}()
+		}
+
+		wg.Wait()
+		close(responseCh)
+	}()
+
+	return responseCh
+}
+
+func (f *Fanout) getFanoutResult(ctx context.Context, responseCh <-chan *response) *response {
+	var result *response
+	for {
+		select {
+		case <-ctx.Done():
+			return result
+		case r, ok := <-responseCh:
+			if !ok {
+				return result
+			}
+			if isBetter(result, r) {
+				result = r
+			}
+			if r.err != nil {
+				break
+			}
+			if f.Race {
+				return r
 			}
 		}
 	}
 }
 
 func (f *Fanout) match(state *request.Request) bool {
-	if !plugin.Name(f.from).Matches(state.Name()) || f.excludeDomains.Contains(state.Name()) {
+	if !plugin.Name(f.From).Matches(state.Name()) || f.ExcludeDomains.Contains(state.Name()) {
 		return false
 	}
 	return true
@@ -203,7 +236,7 @@ func (f *Fanout) match(state *request.Request) bool {
 func (f *Fanout) processClient(ctx context.Context, c Client, r *request.Request) *response {
 	start := time.Now()
 	var err error
-	for j := 0; j < f.attempts || f.attempts == 0; <-time.After(attemptDelay) {
+	for j := 0; j < f.Attempts || f.Attempts == 0; <-time.After(attemptDelay) {
 		if ctx.Err() != nil {
 			return &response{client: c, response: nil, start: start, err: ctx.Err()}
 		}
@@ -212,7 +245,7 @@ func (f *Fanout) processClient(ctx context.Context, c Client, r *request.Request
 		if err == nil {
 			return &response{client: c, response: msg, start: start, err: err}
 		}
-		if f.attempts != 0 {
+		if f.Attempts != 0 {
 			j++
 		}
 	}
